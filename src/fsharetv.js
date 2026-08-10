@@ -11,6 +11,13 @@ const detailCache = new NodeCache({ stdTTL: 300 });
 const BASE = 'https://fsharetv.cc';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
+// CDN hợp lệ — chỉ những domain này mới play được
+const VALID_CDNS = ['vtcdn.sbs', 'vlcdn.sbs'];
+
+function isValidCdn(url) {
+  return VALID_CDNS.some(cdn => url.includes(cdn));
+}
+
 const jar = new CookieJar();
 const client = wrapper(axios.create({
   jar,
@@ -69,7 +76,7 @@ async function fetchJson(url, referer) {
   }
 }
 
-// Follow redirect để lấy URL thực của stream
+// Follow redirect để lấy URL thực
 async function followRedirect(url, referer) {
   try {
     const res = await client.get(url, {
@@ -158,7 +165,7 @@ function sortSources(sources) {
   });
 }
 
-// Gọi API /api/file/<fileId>/source
+// Gọi API /api/file/<fileId>/source — filter chỉ lấy CDN hợp lệ
 async function resolveViaApi(fileId, watchUrl) {
   const apiUrl = `${BASE}/api/file/${fileId}/source?trailer=null&type=watch`;
   console.log('[FshareTV] calling API:', apiUrl);
@@ -167,12 +174,38 @@ async function resolveViaApi(fileId, watchUrl) {
     if (!data) return [];
     const sources = data?.data?.file?.sources || [];
     if (!sources.length) return [];
-    const mapped = sources
-      .filter(s => s.src && s.storage !== '__backup')
-      .map(s => ({
+
+    console.log('[FshareTV] all sources:', sources.map(s => ({
+      q: s.quality || s.label,
+      storage: s.storage,
+      src: (s.src || '').substring(0, 60),
+    })));
+
+    const mapped = [];
+    for (const s of sources) {
+      if (!s.src) continue;
+      if (s.storage === '__backup') continue;
+
+      let url = absUrl(s.src);
+
+      // Resolve /api/media/ redirect trước khi kiểm tra CDN
+      if (url.includes('/api/media/')) {
+        url = await followRedirect(url, watchUrl);
+      }
+
+      // Chỉ lấy CDN hợp lệ
+      if (!isValidCdn(url)) {
+        console.log('[FshareTV] skip invalid CDN:', url.substring(0, 60));
+        continue;
+      }
+
+      mapped.push({
         quality: s.quality || s.label || 'SD',
-        url: absUrl(s.src),
-      }));
+        url,
+      });
+    }
+
+    console.log('[FshareTV] valid sources after filter:', mapped.length);
     return sortSources(mapped);
   } catch(e) {
     console.error('[FshareTV] resolveViaApi error:', e.message);
@@ -201,14 +234,17 @@ async function getStream(slug) {
   const $ = cheerio.load(html);
   let streams = [];
 
-  // Path A: vlcdn.sbs / vtcdn.sbs URL trực tiếp trong HTML
-  const vlcdnMatches = [...html.matchAll(/https:\/\/(?:vlcdn|vtcdn)\.sbs\/media\/[A-Za-z0-9%+/=?&_.,;:-]+/g)];
-  if (vlcdnMatches.length) {
-    console.log('[FshareTV] Path A: vlcdn/vtcdn URLs found:', vlcdnMatches.length);
-    for (const m of vlcdnMatches) {
+  // Path A: tìm CDN URL trực tiếp trong HTML — chỉ lấy vtcdn/vlcdn
+  const allCdnMatches = [...html.matchAll(/https:\/\/[a-z]+cdn[a-z]*\.sbs\/media\/[A-Za-z0-9%+/=?&_.,;:-]+/g)];
+  if (allCdnMatches.length) {
+    console.log('[FshareTV] Path A: CDN URLs in HTML:', allCdnMatches.length);
+    for (const m of allCdnMatches) {
       const url = m[0].replace(/['")\s].*$/, '');
-      if (!streams.find(s => s.url === url)) {
+      if (isValidCdn(url) && !streams.find(s => s.url === url)) {
+        console.log('[FshareTV] Path A: valid CDN:', url.substring(0, 60));
         streams.push({ quality: 'Default', url });
+      } else {
+        console.log('[FshareTV] Path A: skip invalid CDN:', url.substring(0, 60));
       }
     }
   }
@@ -216,7 +252,7 @@ async function getStream(slug) {
   // Path B: <video src>
   if (!streams.length) {
     const videoSrc = $('video').attr('src') || $('video source').attr('src');
-    if (videoSrc) {
+    if (videoSrc && isValidCdn(videoSrc)) {
       console.log('[FshareTV] Path B: video src:', videoSrc);
       streams.push({ quality: 'Default', url: absUrl(videoSrc) });
     }
@@ -261,28 +297,18 @@ async function getStream(slug) {
     }
   }
 
-  // Path G: src trong JS object
+  // Path G: src trong JS object có CDN hợp lệ
   if (!streams.length) {
-    const srcMatch = html.match(/['"]src['"]\s*:\s*['"]([^'"]*(?:vlcdn|vtcdn)[^'"]*)['"]/);
+    const srcMatch = html.match(/['"]src['"]\s*:\s*['"]([^'"]*(?:vtcdn|vlcdn)\.sbs[^'"]*)['"]/);
     if (srcMatch) {
       console.log('[FshareTV] Path G: src in JS object');
       streams.push({ quality: 'Default', url: absUrl(srcMatch[1]) });
     }
   }
 
-  // Path H: /api/media/ URL trực tiếp → follow redirect
+  // Path H: fallback fetch /movie/ page
   if (!streams.length) {
-    const apiMediaMatch = html.match(/https:\/\/fsharetv\.cc\/api\/media\/[A-Za-z0-9%+/=?&_.,;:-]+/);
-    if (apiMediaMatch) {
-      const mediaUrl = apiMediaMatch[0].replace(/['")\s].*$/, '');
-      console.log('[FshareTV] Path H: api/media URL:', mediaUrl.substring(0, 80));
-      streams.push({ quality: 'Default', url: mediaUrl });
-    }
-  }
-
-  // Path I: fallback fetch /movie/ page
-  if (!streams.length) {
-    console.log('[FshareTV] Path I: fallback to /movie/ page');
+    console.log('[FshareTV] Path H: fallback to /movie/ page');
     const movieUrl = `${BASE}/movie/${slug}`;
     const movieHtml = await fetchHtml(movieUrl, watchUrl);
     if (movieHtml) {
@@ -291,10 +317,10 @@ async function getStream(slug) {
         const wUrl = absUrl(wMatch[1]);
         const wHtml = await fetchHtml(wUrl, movieUrl);
         if (wHtml) {
-          const vlMs = [...wHtml.matchAll(/https:\/\/(?:vlcdn|vtcdn)\.sbs\/media\/[A-Za-z0-9%+/=?&_.,;:-]+/g)];
+          const vlMs = [...wHtml.matchAll(/https:\/\/[a-z]+cdn[a-z]*\.sbs\/media\/[A-Za-z0-9%+/=?&_.,;:-]+/g)];
           for (const m of vlMs) {
             const url = m[0].replace(/['")\s].*$/, '');
-            if (!streams.find(s => s.url === url)) {
+            if (isValidCdn(url) && !streams.find(s => s.url === url)) {
               streams.push({ quality: 'Default', url });
             }
           }
@@ -307,22 +333,7 @@ async function getStream(slug) {
     }
   }
 
-  // Resolve redirect cho /api/media/ URLs → vtcdn.sbs / vlcdn.sbs
-  if (streams.length) {
-    const resolved = [];
-    for (const s of streams) {
-      if (s.url.includes('/api/media/')) {
-        console.log('[FshareTV] resolving redirect for:', s.url.substring(0, 80));
-        const finalUrl = await followRedirect(s.url, watchUrl);
-        resolved.push({ ...s, url: finalUrl });
-      } else {
-        resolved.push(s);
-      }
-    }
-    streams = resolved;
-  }
-
-  console.log('[FshareTV] streams found:', streams.length);
+  console.log('[FshareTV] final streams:', streams.length);
   streams.forEach(s => console.log(' -', s.quality, s.url.substring(0, 80)));
 
   const title = $('h1, .movie-title, title').first().text().trim()
