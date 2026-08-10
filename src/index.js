@@ -11,19 +11,21 @@ const EXTRA_FULL = [
 
 const manifest = {
   id: 'community.fsharetv.cc',
-  version: '1.0.0',
+  version: '1.1.0',
   name: 'FshareTV',
   description: 'Xem phim từ FshareTV — phim học ngôn ngữ, dual subtitles',
   logo: 'https://fsharetv.cc/favicon.ico',
   catalogs: [
-    { id: 'fsharetv-home',    type: 'movie', name: '🆕 FshareTV - Mới Nhất', extra: EXTRA_FULL },
-    { id: 'fsharetv-action',  type: 'movie', name: '💥 Action',               extra: EXTRA_BASE },
-    { id: 'fsharetv-drama',   type: 'movie', name: '🎭 Drama',                 extra: EXTRA_BASE },
-    { id: 'fsharetv-comedy',  type: 'movie', name: '😂 Comedy',                extra: EXTRA_BASE },
-    { id: 'fsharetv-horror',  type: 'movie', name: '👻 Horror',                extra: EXTRA_BASE },
-    { id: 'fsharetv-romance', type: 'movie', name: '💕 Romance',               extra: EXTRA_BASE },
-    { id: 'fsharetv-animation',type:'movie', name: '🎌 Animation',             extra: EXTRA_BASE },
-    { id: 'fsharetv-documentary',type:'movie',name:'📹 Documentary',           extra: EXTRA_BASE },
+    { id: 'fsharetv-home',       type: 'movie', name: '🆕 FshareTV - Mới Nhất', extra: EXTRA_FULL },
+    { id: 'fsharetv-action',     type: 'movie', name: '💥 Action',               extra: EXTRA_BASE },
+    { id: 'fsharetv-drama',      type: 'movie', name: '🎭 Drama',                extra: EXTRA_BASE },
+    { id: 'fsharetv-comedy',     type: 'movie', name: '😂 Comedy',               extra: EXTRA_BASE },
+    { id: 'fsharetv-horror',     type: 'movie', name: '👻 Horror',               extra: EXTRA_BASE },
+    { id: 'fsharetv-romance',    type: 'movie', name: '💕 Romance',              extra: EXTRA_BASE },
+    { id: 'fsharetv-animation',  type: 'movie', name: '🎌 Animation',            extra: EXTRA_BASE },
+    { id: 'fsharetv-documentary',type: 'movie', name: '📹 Documentary',          extra: EXTRA_BASE },
+    { id: 'fsharetv-thriller',   type: 'movie', name: '😱 Thriller',             extra: EXTRA_BASE },
+    { id: 'fsharetv-scifi',      type: 'movie', name: '🚀 Science Fiction',      extra: EXTRA_BASE },
   ],
   resources: ['catalog', 'meta', 'stream'],
   types: ['movie'],
@@ -38,6 +40,8 @@ const CATALOG_GENRE = {
   'fsharetv-romance':     'Romance',
   'fsharetv-animation':   'Animation',
   'fsharetv-documentary': 'Documentary',
+  'fsharetv-thriller':    'Thriller',
+  'fsharetv-scifi':       'Science Fiction',
 };
 
 const builder = new addonBuilder(manifest);
@@ -77,18 +81,26 @@ builder.defineStreamHandler(async ({ type, id }) => {
   try {
     const slug = id.replace('fsharetv:', '');
     const data = await fsharetv.getStream(slug);
+
     if (!data || !data.streams.length) {
-      // Fallback: mở trang gốc
       return { streams: [{
-        externalUrl: `https://fsharetv.cc/movie/${slug}`,
+        externalUrl: `https://fsharetv.cc/w/${slug}`,
         title: '🔗 Mở FshareTV',
       }]};
     }
+
     const streams = data.streams.map(s => ({
       url: s.url,
       title: `▶ ${s.quality}p`,
-      behaviorHints: { notWebReady: false },
+      behaviorHints: {
+        notWebReady: false,
+        headers: {
+          'Referer': 'https://fsharetv.cc/',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        },
+      },
     }));
+
     return { streams };
   } catch(e) {
     console.error('[stream] error:', e.message);
