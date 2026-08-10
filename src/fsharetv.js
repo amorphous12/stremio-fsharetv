@@ -69,6 +69,31 @@ async function fetchJson(url, referer) {
   }
 }
 
+// Follow redirect để lấy URL thực của stream
+async function followRedirect(url, referer) {
+  try {
+    const res = await client.get(url, {
+      maxRedirects: 10,
+      headers: {
+        'Referer': referer || BASE + '/',
+        'Accept': '*/*',
+      },
+    });
+    const finalUrl = res.request?.res?.responseUrl
+      || res.request?.responseURL
+      || res.config?.url
+      || url;
+    console.log('[FshareTV] redirect:', url.substring(0, 60), '→', finalUrl.substring(0, 60));
+    return finalUrl;
+  } catch(e) {
+    if (e.response?.headers?.location) {
+      return e.response.headers.location;
+    }
+    console.error('[FshareTV] followRedirect error:', e.message);
+    return url;
+  }
+}
+
 function absUrl(path) {
   if (!path) return '';
   if (path.startsWith('http')) return path;
@@ -83,7 +108,6 @@ function parseMovieGrid(html) {
   const items = [];
   const seen = new Set();
 
-  // Ưu tiên link /w/ vì đó là trang chứa stream
   $('a[href*="/w/"], a[href*="/movie/"]').each((i, el) => {
     const href = $(el).attr('href') || '';
     const slugMatch = href.match(/\/(?:w|movie)\/([^\/\?#]+)/);
@@ -103,7 +127,6 @@ function parseMovieGrid(html) {
     }
   });
 
-  // Fallback: tìm movie-item container
   if (!items.length) {
     $('.movie-item, .film-item, article.item').each((i, el) => {
       const $el = $(el);
@@ -164,7 +187,6 @@ async function getStream(slug) {
 
   await warmUp();
 
-  // Fetch trang /w/ trực tiếp — đây là trang chứa player
   const watchUrl = `${BASE}/w/${slug}`;
   console.log('[FshareTV] fetching watch page:', watchUrl);
   const html = await fetchHtml(watchUrl);
@@ -179,12 +201,12 @@ async function getStream(slug) {
   const $ = cheerio.load(html);
   let streams = [];
 
-  // Path A: vlcdn.sbs URL trực tiếp trong HTML
-  const vlcdnMatches = [...html.matchAll(/https:\/\/vlcdn\.sbs\/media\/[A-Za-z0-9%+/=?&_.-]+/g)];
+  // Path A: vlcdn.sbs / vtcdn.sbs URL trực tiếp trong HTML
+  const vlcdnMatches = [...html.matchAll(/https:\/\/(?:vlcdn|vtcdn)\.sbs\/media\/[A-Za-z0-9%+/=?&_.,;:-]+/g)];
   if (vlcdnMatches.length) {
-    console.log('[FshareTV] Path A: vlcdn URLs found:', vlcdnMatches.length);
+    console.log('[FshareTV] Path A: vlcdn/vtcdn URLs found:', vlcdnMatches.length);
     for (const m of vlcdnMatches) {
-      const url = m[0].replace(/['")\s].*$/, ''); // strip trailing chars
+      const url = m[0].replace(/['")\s].*$/, '');
       if (!streams.find(s => s.url === url)) {
         streams.push({ quality: 'Default', url });
       }
@@ -239,36 +261,43 @@ async function getStream(slug) {
     }
   }
 
-  // Path G: src trong JS object có vlcdn
+  // Path G: src trong JS object
   if (!streams.length) {
-    const srcMatch = html.match(/['"]src['"]\s*:\s*['"]([^'"]*vlcdn[^'"]*)['"]/);
+    const srcMatch = html.match(/['"]src['"]\s*:\s*['"]([^'"]*(?:vlcdn|vtcdn)[^'"]*)['"]/);
     if (srcMatch) {
       console.log('[FshareTV] Path G: src in JS object');
       streams.push({ quality: 'Default', url: absUrl(srcMatch[1]) });
     }
   }
 
-  // Path H: fetch trang /movie/ nếu /w/ không có gì
+  // Path H: /api/media/ URL trực tiếp → follow redirect
   if (!streams.length) {
-    console.log('[FshareTV] Path H: fallback to /movie/ page');
+    const apiMediaMatch = html.match(/https:\/\/fsharetv\.cc\/api\/media\/[A-Za-z0-9%+/=?&_.,;:-]+/);
+    if (apiMediaMatch) {
+      const mediaUrl = apiMediaMatch[0].replace(/['")\s].*$/, '');
+      console.log('[FshareTV] Path H: api/media URL:', mediaUrl.substring(0, 80));
+      streams.push({ quality: 'Default', url: mediaUrl });
+    }
+  }
+
+  // Path I: fallback fetch /movie/ page
+  if (!streams.length) {
+    console.log('[FshareTV] Path I: fallback to /movie/ page');
     const movieUrl = `${BASE}/movie/${slug}`;
     const movieHtml = await fetchHtml(movieUrl, watchUrl);
     if (movieHtml) {
-      // Tìm link /w/ trong trang /movie/
       const wMatch = movieHtml.match(/href=["']([^"']*\/w\/[^"']+)['"]/);
       if (wMatch) {
         const wUrl = absUrl(wMatch[1]);
-        console.log('[FshareTV] Path H: found /w/ link:', wUrl);
         const wHtml = await fetchHtml(wUrl, movieUrl);
         if (wHtml) {
-          const vlcdnMs = [...wHtml.matchAll(/https:\/\/vlcdn\.sbs\/media\/[A-Za-z0-9%+/=?&_.-]+/g)];
-          for (const m of vlcdnMs) {
+          const vlMs = [...wHtml.matchAll(/https:\/\/(?:vlcdn|vtcdn)\.sbs\/media\/[A-Za-z0-9%+/=?&_.,;:-]+/g)];
+          for (const m of vlMs) {
             const url = m[0].replace(/['")\s].*$/, '');
             if (!streams.find(s => s.url === url)) {
               streams.push({ quality: 'Default', url });
             }
           }
-          // Thử API từ trang /w/ mới
           if (!streams.length) {
             const msM = wHtml.match(/Movie\.setSource\s*\(\s*['"]([^'"]+)['"]/);
             if (msM) streams = await resolveViaApi(msM[1].replace(/@/g, '+'), wUrl);
@@ -278,7 +307,23 @@ async function getStream(slug) {
     }
   }
 
+  // Resolve redirect cho /api/media/ URLs → vtcdn.sbs / vlcdn.sbs
+  if (streams.length) {
+    const resolved = [];
+    for (const s of streams) {
+      if (s.url.includes('/api/media/')) {
+        console.log('[FshareTV] resolving redirect for:', s.url.substring(0, 80));
+        const finalUrl = await followRedirect(s.url, watchUrl);
+        resolved.push({ ...s, url: finalUrl });
+      } else {
+        resolved.push(s);
+      }
+    }
+    streams = resolved;
+  }
+
   console.log('[FshareTV] streams found:', streams.length);
+  streams.forEach(s => console.log(' -', s.quality, s.url.substring(0, 80)));
 
   const title = $('h1, .movie-title, title').first().text().trim()
     .replace(/\s*[-|]\s*FshareTV.*$/i, '').trim();
@@ -289,7 +334,7 @@ async function getStream(slug) {
   return result;
 }
 
-// Danh sách phim mới (homepage)
+// Danh sách phim mới
 async function getHome() {
   const key = 'home';
   const c = listCache.get(key); if (c) return c;
@@ -330,7 +375,7 @@ async function search(keyword) {
   listCache.set(key, r); return r;
 }
 
-// Chi tiết phim cho meta handler
+// Chi tiết phim
 async function getDetail(slug) {
   const key = `detail_${slug}`;
   const c = listCache.get(key); if (c) return c;
@@ -341,7 +386,7 @@ async function getDetail(slug) {
   const title = $('h1, .movie-title').first().text().trim()
     .replace(/\s*[-|]\s*FshareTV.*$/i, '').trim() || slug;
   const thumb = $('meta[property="og:image"]').attr('content')
-    || $('.movie-poster img, .film-poster img').first().attr('src') || '';
+    || $('.movie-poster img').first().attr('src') || '';
   const desc = $('meta[property="og:description"]').attr('content')
     || $('.movie-desc, .description').first().text().trim() || '';
   const year = ($('.year, .release-year').first().text().match(/\d{4}/) || [])[0];
